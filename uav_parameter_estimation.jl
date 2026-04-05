@@ -3,25 +3,28 @@ using ModelingToolkit: t_nounits as t, D_nounits as D
 using OrdinaryDiffEq
 using Optimization, OptimizationOptimJL, SciMLSensitivity
 using Random
+using Statistics
 using Plots
 
 # ------------------------------------------------------------
-# Upgraded proof-of-concept:
-# Coupled two-state longitudinal UAV-style model
+# Upgrade: multi-trajectory parameter estimation + validation
 #
 # States:
 #   v(t)      = forward speed (m/s)
 #   theta(t)  = pitch angle (rad)
 #
-# Simplified dynamics:
+# Simplified longitudinal model:
 #   dv/dt     = T_eff - Cd_eff*v^2 - g*theta
 #   dtheta/dt = -k_theta*theta + k_v*(v - v_trim)
 #
 # Parameters to estimate:
-#   T_eff   = effective thrust-to-mass term
-#   Cd_eff  = effective quadratic drag term
-#   k_theta = pitch restoring term
-#   k_v     = simplified speed-to-pitch coupling term
+#   T_eff, Cd_eff, k_theta, k_v
+#
+# Training:
+#   Fit one common parameter set using two noisy trajectories
+#
+# Validation:
+#   Test the fitted parameters on a third unseen trajectory
 # ------------------------------------------------------------
 
 @parameters T_eff Cd_eff k_theta k_v
@@ -38,16 +41,11 @@ eqs = [
 @named uav_longitudinal_model = ODESystem(eqs, t)
 sys = structural_simplify(uav_longitudinal_model)
 
-# "True" parameters used to generate synthetic flight-style data
+# True parameters used to generate synthetic flight-style data
 T_true = 8.0
 Cd_true = 0.03
 k_theta_true = 0.9
 k_v_true = 0.02
-
-u0 = [
-    v => 14.0,
-    theta => 0.06
-]
 
 p_true = [
     T_eff => T_true,
@@ -59,23 +57,56 @@ p_true = [
 tspan = (0.0, 25.0)
 save_times = 0.0:0.5:25.0
 
-# Generate synthetic truth solution
-prob_true = ODEProblem(sys, u0, tspan, p_true)
-sol_true = solve(prob_true, Tsit5(); saveat = save_times)
-
-v_clean = Array(sol_true[v])
-theta_clean = Array(sol_true[theta])
-
-# Create noisy "measured" flight-style data
-Random.seed!(42)
+# Measurement noise levels
 sigma_v = 0.12
 sigma_theta = 0.003
 
-v_data = v_clean .+ sigma_v .* randn(length(v_clean))
-theta_data = theta_clean .+ sigma_theta .* randn(length(theta_clean))
+# ------------------------------------------------------------
+# Helper functions
+# ------------------------------------------------------------
 
-# Initial guess for estimation
-p_guess = [6.5, 0.04, 0.6, 0.01]
+function simulate_states(u0_map, p_map)
+    vals = merge(Dict(u0_map), Dict(p_map))
+    prob = ODEProblem(sys, vals, tspan)
+    sol = solve(prob, Tsit5(); saveat = save_times, abstol = 1e-8, reltol = 1e-8)
+    return Array(sol[v]), Array(sol[theta])
+end
+
+function build_dataset(u0_map; rng = Random.default_rng())
+    v_true, theta_true = simulate_states(u0_map, p_true)
+    v_data = v_true .+ sigma_v .* randn(rng, length(v_true))
+    theta_data = theta_true .+ sigma_theta .* randn(rng, length(theta_true))
+
+    return (
+        u0 = u0_map,
+        v_true = v_true,
+        theta_true = theta_true,
+        v_data = v_data,
+        theta_data = theta_data
+    )
+end
+
+rmse(x, y) = sqrt(mean((x .- y).^2))
+
+# ------------------------------------------------------------
+# Build multiple synthetic trajectories
+# ------------------------------------------------------------
+
+Random.seed!(42)
+
+train_u0s = [
+    [v => 14.0, theta => 0.06],
+    [v => 18.0, theta => -0.03]
+]
+
+val_u0 = [v => 15.5, theta => 0.025]
+
+train_sets = [build_dataset(u0) for u0 in train_u0s]
+val_set = build_dataset(val_u0)
+
+# ------------------------------------------------------------
+# Loss: joint fit across both training trajectories
+# ------------------------------------------------------------
 
 function loss(p, _)
     T_val, Cd_val, k_theta_val, k_v_val = p
@@ -91,35 +122,38 @@ function loss(p, _)
         k_v => k_v_val
     ]
 
+    total_loss = 0.0
+
     try
-        prob = ODEProblem(sys, u0, tspan, p_map)
-        sol = solve(prob, Tsit5(); saveat = save_times, abstol = 1e-8, reltol = 1e-8)
+        for ds in train_sets
+            v_pred, theta_pred = simulate_states(ds.u0, p_map)
 
-        v_pred = Array(sol[v])
-        theta_pred = Array(sol[theta])
+            loss_v = sum(((v_pred .- ds.v_data) ./ sigma_v).^2) / length(v_pred)
+            loss_theta = sum(((theta_pred .- ds.theta_data) ./ sigma_theta).^2) / length(theta_pred)
 
-        # Weighted loss so velocity and pitch angle both matter appropriately
-        loss_v = sum(((v_pred .- v_data) ./ sigma_v).^2) / length(v_data)
-        loss_theta = sum(((theta_pred .- theta_data) ./ sigma_theta).^2) / length(theta_data)
+            total_loss += loss_v + loss_theta
+        end
 
-        return loss_v + loss_theta
+        return total_loss / length(train_sets)
     catch
         return 1.0e12
     end
 end
 
+# ------------------------------------------------------------
+# Optimisation
+# ------------------------------------------------------------
+
+p_guess = [6.5, 0.04, 0.6, 0.01]
+
 optf = OptimizationFunction(loss, Optimization.AutoForwardDiff())
 optprob = OptimizationProblem(optf, p_guess)
 
-# Two-stage optimisation for a more robust fit
 result_nm = solve(optprob, NelderMead(); maxiters = 2000)
 optprob_refined = OptimizationProblem(optf, result_nm.u)
 result = solve(optprob_refined, BFGS(); maxiters = 2000)
 
-T_est = result.u[1]
-Cd_est = result.u[2]
-k_theta_est = result.u[3]
-k_v_est = result.u[4]
+T_est, Cd_est, k_theta_est, k_v_est = result.u
 
 p_est = [
     T_eff => T_est,
@@ -128,53 +162,119 @@ p_est = [
     k_v => k_v_est
 ]
 
-prob_est = ODEProblem(sys, u0, tspan, p_est)
-sol_est = solve(prob_est, Tsit5(); saveat = save_times)
+# ------------------------------------------------------------
+# Evaluate fitted model on training and validation data
+# ------------------------------------------------------------
 
-v_est = Array(sol_est[v])
-theta_est = Array(sol_est[theta])
+train_preds = map(train_sets) do ds
+    v_pred, theta_pred = simulate_states(ds.u0, p_est)
+    (
+        v_pred = v_pred,
+        theta_pred = theta_pred
+    )
+end
 
-println("----- Parameter estimation results -----")
-println("True T_eff      = ", T_true)
-println("Estimated T_eff = ", round(T_est, digits = 6))
-println("True Cd_eff      = ", Cd_true)
-println("Estimated Cd_eff = ", round(Cd_est, digits = 6))
+val_v_pred, val_theta_pred = simulate_states(val_set.u0, p_est)
+
+# Metrics
+train_v_rmse = [rmse(pred.v_pred, ds.v_data) for (pred, ds) in zip(train_preds, train_sets)]
+train_theta_rmse = [rmse(pred.theta_pred, ds.theta_data) for (pred, ds) in zip(train_preds, train_sets)]
+
+val_v_rmse = rmse(val_v_pred, val_set.v_data)
+val_theta_rmse = rmse(val_theta_pred, val_set.theta_data)
+
+println("----- Estimated parameters -----")
+println("True T_eff        = ", T_true)
+println("Estimated T_eff   = ", round(T_est, digits = 6))
+println("True Cd_eff       = ", Cd_true)
+println("Estimated Cd_eff  = ", round(Cd_est, digits = 6))
 println("True k_theta      = ", k_theta_true)
 println("Estimated k_theta = ", round(k_theta_est, digits = 6))
-println("True k_v      = ", k_v_true)
-println("Estimated k_v = ", round(k_v_est, digits = 6))
-println("Final loss     = ", round(loss(result.u, nothing), digits = 8))
+println("True k_v          = ", k_v_true)
+println("Estimated k_v     = ", round(k_v_est, digits = 6))
+println("Final loss        = ", round(loss(result.u, nothing), digits = 8))
 
-# Convert pitch angle to degrees for clearer plotting
-theta_clean_deg = theta_clean .* (180 / pi)
-theta_data_deg = theta_data .* (180 / pi)
-theta_est_deg = theta_est .* (180 / pi)
+println("\n----- Training RMSE -----")
+for i in eachindex(train_sets)
+    println("Run ", i, " velocity RMSE (m/s): ", round(train_v_rmse[i], digits = 6))
+    println("Run ", i, " pitch RMSE (rad):    ", round(train_theta_rmse[i], digits = 6))
+end
 
-p1 = plot(
-    save_times,
-    v_clean,
-    label = "True velocity",
-    linewidth = 2,
+println("\n----- Validation RMSE -----")
+println("Validation velocity RMSE (m/s): ", round(val_v_rmse, digits = 6))
+println("Validation pitch RMSE (rad):    ", round(val_theta_rmse, digits = 6))
+
+# ------------------------------------------------------------
+# Plotting
+# ------------------------------------------------------------
+
+theta_to_deg(x) = x .* (180 / pi)
+
+# Training velocity plot
+p_train_v = plot(
+    title = "Training trajectories: velocity fit",
     xlabel = "Time (s)",
     ylabel = "Velocity (m/s)",
-    title = "Longitudinal UAV velocity fit"
+    legend = :best
 )
-scatter!(p1, save_times, v_data, label = "Noisy data", markersize = 3)
-plot!(p1, save_times, v_est, label = "Fitted model", linewidth = 2)
-savefig(p1, "longitudinal_velocity_fit.png")
 
-p2 = plot(
-    save_times,
-    theta_clean_deg,
-    label = "True pitch angle",
-    linewidth = 2,
+plot!(p_train_v, save_times, train_sets[1].v_true, label = "Run 1 true", linewidth = 2)
+scatter!(p_train_v, save_times, train_sets[1].v_data, label = "Run 1 data", markersize = 3)
+plot!(p_train_v, save_times, train_preds[1].v_pred, label = "Run 1 fitted", linewidth = 2)
+
+plot!(p_train_v, save_times, train_sets[2].v_true, label = "Run 2 true", linewidth = 2, linestyle = :dash)
+scatter!(p_train_v, save_times, train_sets[2].v_data, label = "Run 2 data", markersize = 3)
+plot!(p_train_v, save_times, train_preds[2].v_pred, label = "Run 2 fitted", linewidth = 2, linestyle = :dash)
+
+# Training pitch plot
+p_train_theta = plot(
+    title = "Training trajectories: pitch-angle fit",
     xlabel = "Time (s)",
     ylabel = "Pitch angle (deg)",
-    title = "Longitudinal UAV pitch-angle fit"
+    legend = :best
 )
-scatter!(p2, save_times, theta_data_deg, label = "Noisy data", markersize = 3)
-plot!(p2, save_times, theta_est_deg, label = "Fitted model", linewidth = 2)
-savefig(p2, "longitudinal_pitch_angle_fit.png")
 
-println("Saved figure: longitudinal_velocity_fit.png")
-println("Saved figure: longitudinal_pitch_angle_fit.png")
+plot!(p_train_theta, save_times, theta_to_deg(train_sets[1].theta_true), label = "Run 1 true", linewidth = 2)
+scatter!(p_train_theta, save_times, theta_to_deg(train_sets[1].theta_data), label = "Run 1 data", markersize = 3)
+plot!(p_train_theta, save_times, theta_to_deg(train_preds[1].theta_pred), label = "Run 1 fitted", linewidth = 2)
+
+plot!(p_train_theta, save_times, theta_to_deg(train_sets[2].theta_true), label = "Run 2 true", linewidth = 2, linestyle = :dash)
+scatter!(p_train_theta, save_times, theta_to_deg(train_sets[2].theta_data), label = "Run 2 data", markersize = 3)
+plot!(p_train_theta, save_times, theta_to_deg(train_preds[2].theta_pred), label = "Run 2 fitted", linewidth = 2, linestyle = :dash)
+
+training_fig = plot(p_train_v, p_train_theta; layout = (1, 2), size = (1300, 450))
+savefig(training_fig, "multi_trajectory_training_fit.png")
+
+# Validation velocity plot
+p_val_v = plot(
+    save_times,
+    val_set.v_true,
+    label = "Validation true",
+    linewidth = 2,
+    title = "Validation trajectory: velocity fit",
+    xlabel = "Time (s)",
+    ylabel = "Velocity (m/s)",
+    legend = :best
+)
+scatter!(p_val_v, save_times, val_set.v_data, label = "Validation data", markersize = 3)
+plot!(p_val_v, save_times, val_v_pred, label = "Validation fitted", linewidth = 2)
+
+# Validation pitch plot
+p_val_theta = plot(
+    save_times,
+    theta_to_deg(val_set.theta_true),
+    label = "Validation true",
+    linewidth = 2,
+    title = "Validation trajectory: pitch-angle fit",
+    xlabel = "Time (s)",
+    ylabel = "Pitch angle (deg)",
+    legend = :best
+)
+scatter!(p_val_theta, save_times, theta_to_deg(val_set.theta_data), label = "Validation data", markersize = 3)
+plot!(p_val_theta, save_times, theta_to_deg(val_theta_pred), label = "Validation fitted", linewidth = 2)
+
+validation_fig = plot(p_val_v, p_val_theta; layout = (1, 2), size = (1300, 450))
+savefig(validation_fig, "multi_trajectory_validation_fit.png")
+
+println("\nSaved figure: multi_trajectory_training_fit.png")
+println("Saved figure: multi_trajectory_validation_fit.png")
